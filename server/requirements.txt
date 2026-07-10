@@ -1,0 +1,28 @@
+# LangChain
+langchain>=0.3.0
+langchain-core>=0.3.0
+langgraph>=0.2.0
+
+# LLM Provider
+langchain-groq>=0.2.0
+
+# API
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+
+# Data validation
+pydantic>=2.10.0
+
+# Environment variables
+python-dotenv>=1.0.1
+
+# HTTP client
+httpx>=0.28.0
+
+# Database
+sqlalchemy>=2.0.35
+psycopg[binary]>=3.2.3
+
+# Utilities
+python-dateutil>=2.9.0
+typing-extensions>=4.12.2

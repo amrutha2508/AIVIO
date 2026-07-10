@@ -1,0 +1,69 @@
+# =========================================================
+# Root / General
+# =========================================================
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+.vscode/
+.idea/
+*.swp
+
+# =========================================================
+# Environment files (never commit secrets / API keys)
+# =========================================================
+.env
+.env.*
+!.env.example
+**/GROQ_API_KEY*
+
+# =========================================================
+# Client (React + Vite)
+# =========================================================
+client/node_modules/
+client/dist/
+client/dist-ssr/
+client/build/
+client/.vite/
+client/coverage/
+client/*.local
+client/npm-debug.log*
+client/yarn-debug.log*
+client/yarn-error.log*
+client/pnpm-debug.log*
+
+# =========================================================
+# Server (Python / FastAPI / LangGraph)
+# =========================================================
+server/__pycache__/
+server/**/__pycache__/
+*.py[cod]
+*$py.class
+server/venv/
+server/.venv/
+server/env/
+server/*.egg-info/
+server/.pytest_cache/
+server/.mypy_cache/
+server/.ipynb_checkpoints/
+server/notebooks/.ipynb_checkpoints/
+
+# =========================================================
+# Database (Postgres / Docker)
+# =========================================================
+server/pg_db/pgdata/
+server/pg_db/*.env
+server/pg_db/data/
+*.sql.bak
+
+# =========================================================
+# Node (root-level, if any tooling lives here)
+# =========================================================
+node_modules/
+npm-debug.log*
+
+# =========================================================
+# OS / Editor junk
+# =========================================================
+*.bak
+*.orig

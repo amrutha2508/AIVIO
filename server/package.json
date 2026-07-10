@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "pg": "^8.22.0",
+    "psycopg2-binary": "^0.0.1"
+  }
+}
