@@ -1,6 +1,8 @@
 import json
 from typing import Optional, Dict, Any, List
 from services.db_pool import query
+from agent.index import INITIAL_FORM_DATA, InteractionFormData
+from copy import deepcopy
 
 REQUIRED_FIELDS = ["hcp_name", "interaction_type", "interaction_date", "interaction_time", "outcomes"]
 
@@ -26,26 +28,44 @@ def reset_interaction_form_data(interaction_id: str) -> None:
     set_clauses.append("updated_at = NOW()")
     query(f"UPDATE public.interactions SET {', '.join(set_clauses)} WHERE id = %s", [interaction_id]) 
 
-def get_form_data_from_interaction(interaction_row: Optional[dict]) -> dict:
-    """Convert a DB row into the flat form_data dict the agent/tools expect."""
+def get_form_data_from_interaction(
+    interaction_row: Optional[dict],
+) -> InteractionFormData:
+    """Convert a DB row into the complete agent form state."""
+
+    form_data = deepcopy(INITIAL_FORM_DATA)
+
     if not interaction_row:
-        return {}
-    form_data = {
+        return form_data
+
+    form_data.update({
+        "interaction_id": (
+            str(interaction_row["id"])
+            if interaction_row.get("id")
+            else None
+        ),
         "hcp_name": interaction_row.get("hcp_name"),
         "interaction_type": interaction_row.get("interaction_type"),
-        "interaction_date": interaction_row["interaction_date"].isoformat()
-        if interaction_row.get("interaction_date") else None,
-        "interaction_time": interaction_row["interaction_time"].strftime("%H:%M")
-        if interaction_row.get("interaction_time") else None,
+        "interaction_date": (
+            interaction_row["interaction_date"].isoformat()
+            if interaction_row.get("interaction_date")
+            else None
+        ),
+        "interaction_time": (
+            interaction_row["interaction_time"].strftime("%H:%M")
+            if interaction_row.get("interaction_time")
+            else None
+        ),
         "attendees": interaction_row.get("attendees") or [],
         "materials_shared": interaction_row.get("materials_shared") or [],
         "samples_distributed": interaction_row.get("samples_distributed") or [],
         "hcp_sentiment": interaction_row.get("hcp_sentiment"),
         "outcomes": interaction_row.get("outcomes"),
         "follow_up_actions": interaction_row.get("follow_up_actions") or [],
-    }
-    # Drop unset keys so agent merge logic treats them as "not yet provided"
-    return {k: v for k, v in form_data.items() if v not in (None, "")}
+        "validation_errors": [],
+    })
+
+    return form_data
 
 
 def update_interaction_form_data(interaction_id: str, form_data: dict, status: Optional[str] = None) -> None:

@@ -12,25 +12,23 @@ from datetime import datetime
 import asyncio
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-
-
-
+from copy import deepcopy
 load_dotenv()
-os.environ["GROQ_API_KEY"] = "GROQ_API_KEY"
 
 llm = ChatGroq(
     model="llama-3.3-70b-versatile",
     temperature=0.1
 )
 
-
+class FollowUpActionsResult(BaseModel):
+    follow_up_actions: List[str] = Field(default_factory=list)
 
 class InteractionFormData(TypedDict, total=False):
     interaction_id: Optional[str]
     hcp_name: Optional[str]
-    interaction_type: Optional[str]
-    interaction_date: Optional[str]
-    interaction_time: Optional[str]
+    interaction_type: str
+    interaction_date: str
+    interaction_time: str
     attendees: List[str]
     materials_shared: List[str]
     samples_distributed: List[str]
@@ -39,13 +37,29 @@ class InteractionFormData(TypedDict, total=False):
     follow_up_actions: List[str]
     validation_errors: List[str]
 
-
 class CustomAgentState(TypedDict):
     messages: Annotated[list, add_messages]
     form_data: InteractionFormData
+    validation_failed: bool
 
-class FollowUpActionsResult(BaseModel):
-    follow_up_actions: List[str] = Field(default_factory=list)
+
+
+INITIAL_FORM_DATA: InteractionFormData = {
+    "interaction_id": None,
+    "hcp_name": None,
+    "interaction_type": None,
+    "interaction_date": None,
+    "interaction_time": None,
+    "attendees": [],
+    "materials_shared": [],
+    "samples_distributed": [],
+    "hcp_sentiment": None,
+    "outcomes": None,
+    "follow_up_actions": [],
+    "validation_errors": [],
+}
+
+
 # =========================================================
 # BASE PROMPT
 # =========================================================
@@ -85,9 +99,11 @@ Date/time default rules:
 Completion flow:
 - After every final assistant response that updates or summarizes the form, ask:
   "Please provide any further changes, or type done to submit."
-- If the user types "done", "Done", or similar, use validate_interaction_tool.
+- If the user types "done", "Done", or similar:
+  - FIRST, check if the most recent message in the history is a failed validation tool execution.
+  - If validation has ALREADY failed in the immediate previous step, DO NOT call the validation tool again. Instead, write a natural language response explaining to the user what fields are missing and ask them to provide them.
+  - If validation has NOT been run yet for this "done" request, go ahead and call `validate_interaction_tool`.
 - Do not submit until validation passes.
-- If validation fails, tell the user which required fields are missing.
 
 Tool usage rules:
 - Use log_interaction_tool when the user describes a new interaction for the first time.
@@ -101,34 +117,45 @@ Tool usage rules:
   interaction and start completely over (e.g. "start over", "scrap this",
   "clear the whole form", "reset everything"). Never use it for clearing a
   single field.
-- Use validate_interaction_tool when the user says done, Done, or asks if the
-  form is complete/ready to submit.
-
+- Use validate_interaction_tool when the user says "done", "Done", or asks if the form is complete/ready to submit. 
+- CRITICAL: If the tool returns a validation failed/error message, stop calling tools. Directly show that error message to the user as a natural language response and ask them to provide the missing information (e.g., "Please provide the interaction_time to proceed")
 
 Never directly output JSON to the user unless asked.
 After a tool updates the form, briefly summarize what changed.
 """
-
-
-# =========================================================
-# HELPERS
-# =========================================================
-
-def merge_form_data(
-    current: InteractionFormData,
-    updates: Dict[str, Any]
-) -> InteractionFormData:
+def format_chat_history(chat_history: List[Dict[str, str]]) -> str:
     """
-    Merge updates into current form data.
-    Lists are replaced only when explicitly provided.
+    Format chat history into a readable string for the system prompt
     """
-    updated = dict(current or {})
+    print("inside format_chat_history")
+    if not chat_history:
+        return ""
 
-    for key, value in updates.items():
-        if value is not None:
-            updated[key] = value
+    formatted_messages = []
+    for msg in chat_history:
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        role_lable = "User Message" if role.lower() == "user" else "AI Messaage"
+        formatted_messages.append(f"{role_lable}: {content}")
 
-    return updated
+    # print("formatted_messages:", "\n\n".join(formatted_messages))
+    return "\n\n".join(formatted_messages)
+
+def get_system_prompt(chat_history: Optional[List[Dict[str, str]]] = None) -> str:
+    """
+    Get the system prompt for the RAG agent, optionally including chat history.
+    """
+    prompt = BASE_SYSTEM_PROMPT
+    if chat_history:
+        formatted_history = format_chat_history(chat_history)
+        if formatted_history:
+            prompt += "\n\n### Previous Conversation Context\n"
+            prompt += "The following is the recent conversation history for context: \n\n"
+            prompt += formatted_history
+            prompt += "\n\nUse this conversation history to understand context and references in the current question."
+    # print("system_prompt: ", prompt)
+    return prompt
+
 
 
 EXTRACTION_PROMPT = """
@@ -207,7 +234,7 @@ async def log_interaction_tool(
     Input should be the user's raw natural language message.
     The tool extracts form fields and updates the form state.
     """
-    print("inside log_interaction_tool")
+    print("*"*20," inside log_interaction_tool","*"*20)
     now = datetime.now()
     current_date = now.strftime("%Y-%m-%d")
     current_time = now.strftime("%H:%M")
@@ -242,9 +269,8 @@ async def log_interaction_tool(
         }
     )
 
-
 EDIT_EXTRACTION_PROMPT = """
-You update an existing HCP interaction form based on a correction message.
+You update an existing HCP interaction form based on a correction, addition, deletion, or reset message.
 
 Current form data:
 {current_form_data}
@@ -254,38 +280,59 @@ User correction message:
 
 Extract only the fields that should change.
 
-Rules:
+Rules for Updates & Additions:
 - Do not return the full form.
-- Return only fields explicitly corrected or updated by the user.
-- Preserve all other existing fields.
-- If the user says a value was wrong, replace only that field.
-- Do NOT modify follow_up_actions here — that is handled by a different tool.
-- interaction_type must be exactly one of: "Sync / Call", "Office Visit", "Conference / Event",
-  "Email / Digital", "Group Meeting", "Sample Drop", "Other". Choose the closest match based
-  on context (e.g. a phone call or virtual sync -> "Sync / Call"; an in-person meeting at the
-  HCP's office -> "Office Visit").
-- Return only valid JSON.
-- Do not include markdown.
+- Return only fields explicitly corrected, added, updated, or removed by the user.
+- If the user provides a value for a field that is currently missing, empty, or null, extract it anyway.
+- Use HH:MM 24-hour format for time updates (e.g., "10 am" -> "10:00", "2:30 pm" -> "14:30").
+- interaction_type must be exactly one of: "Sync / Call", "Office Visit", "Conference / Event", "Email / Digital", "Group Meeting", "Sample Drop", "Other".
 
-Example:
+Rules for Removal, Deletions, & Clears:
+- If the user asks to clear, remove, or delete a scalar field (like interaction_time, hcp_name, outcomes, hcp_sentiment, etc.), set that field's value to null.
+- If the user asks to clear list fields (like attendees, materials_shared, samples_distributed), set that field's value to [].
+- Do NOT modify follow_up_actions here under any circumstances.
+
+Return ONLY valid JSON. Do not include markdown formatting or backticks.
+
+Example 1 (Addition):
+Current form:
+{{
+  "hcp_name": "Dr. Smith",
+  "interaction_date": "2026-07-09"
+}}
+User correction: "set the time to 10 am"
+Output:
+{{
+  "interaction_time": "10:00"
+}}
+
+Example 2 (Removal/Reset):
 Current form:
 {{
   "hcp_name": "Dr. Smith",
   "interaction_date": "2026-07-09",
-  "hcp_sentiment": "positive",
-  "materials_shared": ["brochures"]
+  "interaction_time": "14:30"
 }}
-
-User correction:
-Sorry, the name was actually Dr. John and the sentiment was negative.
-
+User correction: "remove the time and clear attendees"
 Output:
 {{
-  "hcp_name": "Dr. John",
-  "hcp_sentiment": "negative"
+  "interaction_time": null,
+  "attendees": []
 }}
 """
 
+
+EDITABLE_FIELDS = {
+    "hcp_name",
+    "interaction_type",
+    "interaction_date",
+    "interaction_time",
+    "attendees",
+    "materials_shared",
+    "samples_distributed",
+    "hcp_sentiment",
+    "outcomes",
+}
 
 @tool
 async def edit_interaction_tool(
@@ -294,50 +341,57 @@ async def edit_interaction_tool(
     tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> Command:
     """
-    Use this tool when the user corrects or updates an existing scalar field
-    (hcp_name, interaction_type, interaction_date, interaction_time, hcp_sentiment,
-    outcomes, attendees, materials_shared, samples_distributed).
-    Do NOT use this for follow_up_actions changes — use manage_follow_up_tool instead.
-    The tool extracts only the changed fields.
+    Use this tool when the user corrects, fills, removes, or clears an existing
+    interaction field, excluding follow_up_actions.
     """
     print("inside edit_interaction_tool")
+
     prompt = EDIT_EXTRACTION_PROMPT.format(
-        current_form_data=json.dumps(current_form_data, indent=2),
+        current_form_data=json.dumps(
+            current_form_data,
+            indent=2,
+            default=str,
+        ),
         message=message,
     )
 
-    result = await llm.ainvoke(prompt)
-
     try:
-        extracted_updates = json.loads(result.content)
-        # Clear out validation errors since a field was updated
-        extracted_updates["validation_errors"] = []
-        print("extracted_updates:", extracted_updates)
-        # extracted_updates = json.loads(result.content)
-        # print("extracted_updates:", extracted_updates)
-    except Exception:
+        result = await llm.ainvoke(prompt)
+        parsed_updates = json.loads(result.content)
+
+        if not isinstance(parsed_updates, dict):
+            raise ValueError("Edit extraction result must be a JSON object")
+
+        extracted_updates = {
+            key: value
+            for key, value in parsed_updates.items()
+            if key in EDITABLE_FIELDS
+        }
+
+    except Exception as exc:
+        print("edit_interaction_tool error:", repr(exc))
         extracted_updates = {}
+
+    updated_form = dict(current_form_data or {})
+    updated_form.update(extracted_updates)
+    updated_form["validation_errors"] = []
 
     return Command(
         update={
-            "form_data": extracted_updates,
+            "form_data": updated_form,
             "messages": [
                 ToolMessage(
-                    content=f"Updated fields: {json.dumps(extracted_updates)}",
+                    content=(
+                        f"Updated fields: {json.dumps(extracted_updates)}"
+                        if extracted_updates
+                        else "No valid form updates were identified."
+                    ),
                     tool_call_id=tool_call_id,
+                    name="edit_interaction_tool",
                 )
             ],
         }
     )
-
-
-REQUIRED_FIELDS = [
-    "hcp_name",
-    "interaction_type",
-    "interaction_date",
-    "interaction_time",
-    # "outcomes",
-]
 
 
 @tool
@@ -383,73 +437,28 @@ async def reset_form_tool(
         }
     )
 
-
-@tool
-async def validate_interaction_tool(
-    current_form_data: Dict[str, Any],
-    tool_call_id: Annotated[str, InjectedToolCallId],
-) -> Command:
-    """
-    Use this tool when the user says done, Done, or asks if the form is
-    complete / ready to submit.
-    Validates required fields are not null or empty.
-    """
-    print("inside validate_interaction_tool")
-    missing = []
-
-    for field in REQUIRED_FIELDS:
-        value = current_form_data.get(field)
-        if value is None or value == "" or value == []:
-            missing.append(field)
-
-    validation_errors = [
-        f"{field} is required" for field in missing
-    ]
-
-    return Command(
-        update={
-            "form_data": {
-                **current_form_data,
-                "validation_errors": validation_errors,
-            },
-            "messages": [
-                ToolMessage(
-                    content=(
-                        "Validation passed. Form is ready to submit."
-                        if not validation_errors
-                        else f"Validation failed. Missing fields: {missing}. "
-                             f"Please provide any further changes, or type done to submit."
-                    ),
-                    tool_call_id=tool_call_id,
-                )
-            ],
-        }
-    )
-
-
 MANAGE_FOLLOWUP_PROMPT = """
-Update an existing follow-up action list based on the user's instruction.
+You are a precise data assistant tasked with updating a list of future follow-up actions for an HCP interaction form based on user instructions.
 
 Current date:
 {current_date}
 
-Current follow-up actions:
+Current follow-up actions list:
 {current_follow_ups}
 
 User instruction:
 {message}
 
 Requirements:
-- Preserve every existing action unless explicitly removed or replaced.
-- ADD: append the new action.
-- REMOVE: remove the matching action.
-- REPLACE: remove the old action and append the replacement.
-- A message may contain both ADD and REMOVE.
-- Do not convert relative wording unless required.
-- Preserve wording such as "next month", "next Tuesday", and "in two weeks".
-- Return the full updated follow-up action list.
-"""
+- Preserve every existing action in the list unless the user explicitly asks to remove or replace it.
+- ADD: If the user adds a new task, append it to the list.
+- REMOVE: If the user cancels or removes a task, remove it from the list.
+- REPLACE: If the user updates an action, swap the old version for the new one.
+- A single message might contain both additions and removals.
+- Do not compute relative dates into static absolute dates unless requested. Preserve phrases like "next month", "next Tuesday", and "in two weeks".
 
+CRITICAL: You must return a valid JSON object matching the requested schema. It must contain the key "follow_up_actions" mapping to a list of strings.
+"""
 
 @tool
 async def manage_follow_up_tool(
@@ -458,15 +467,16 @@ async def manage_follow_up_tool(
     tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> Command:
     """
-    Add, remove or replace follow-up actions.
+    Add, remove, or replace follow-up actions inside the follow_up_actions list.
     """
     print("inside manage_follow_up_tool")
 
+    # Guard against missing or null form data state
+    current_form = dict(current_form_data or {})
     current_date = datetime.now().strftime("%Y-%m-%d")
 
-    current_follow_ups = list(
-        current_form_data.get("follow_up_actions", []) or []
-    )
+    # Safely retrieve and copy the existing array
+    current_follow_ups = list(current_form.get("follow_up_actions", []) or [])
 
     prompt = MANAGE_FOLLOWUP_PROMPT.format(
         current_date=current_date,
@@ -475,26 +485,26 @@ async def manage_follow_up_tool(
     )
 
     follow_up_llm = llm.with_structured_output(FollowUpActionsResult)
+    
     try:
         result = await follow_up_llm.ainvoke(prompt)
-
         print("structured manage_follow_up_tool result:", result)
 
+        # Access via the Pydantic model's field property safely
         updated_follow_ups = [
             item.strip()
             for item in result.follow_up_actions
             if item and item.strip()
         ]
-
     except Exception as exc:
-        print("manage_follow_up_tool error:", repr(exc))
+        print("manage_follow_up_tool parsing error:", repr(exc))
+        # If the LLM errors or hallucinates formatting, fall back safely to old actions
         updated_follow_ups = current_follow_ups
 
-    updated_form_data = {
-        **current_form_data,
-        "follow_up_actions": updated_follow_ups,
-        "validation_errors": [],
-    }
+    # Merge cleanly back into the full form context
+    updated_form_data = dict(current_form)
+    updated_form_data["follow_up_actions"] = updated_follow_ups
+    updated_form_data["validation_errors"] = []
 
     return Command(
         update={
@@ -512,39 +522,93 @@ async def manage_follow_up_tool(
         }
     )
 
-def format_chat_history(chat_history: List[Dict[str, str]]) -> str:
-    """
-    Format chat history into a readable string for the system prompt
-    """
-    print("inside format_chat_history")
-    if not chat_history:
-        return ""
+REQUIRED_FIELDS = [
+    "hcp_name",
+    "interaction_type",
+    "interaction_date",
+    "interaction_time",
+    # "outcomes",
+]
 
-    formatted_messages = []
-    for msg in chat_history:
-        role = msg.get("role", "unknown")
-        content = msg.get("content", "")
-        role_lable = "User Message" if role.lower() == "user" else "AI Messaage"
-        formatted_messages.append(f"{role_lable}: {content}")
-
-    # print("formatted_messages:", "\n\n".join(formatted_messages))
-    return "\n\n".join(formatted_messages)
-
-
-def get_system_prompt(chat_history: Optional[List[Dict[str, str]]] = None) -> str:
+@tool
+async def validate_interaction_tool(
+    current_form_data: Dict[str, Any],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> Command:
     """
-    Get the system prompt for the RAG agent, optionally including chat history.
+    Validate required interaction fields.
     """
-    prompt = BASE_SYSTEM_PROMPT
-    if chat_history:
-        formatted_history = format_chat_history(chat_history)
-        if formatted_history:
-            prompt += "\n\n### Previous Conversation Context\n"
-            prompt += "The following is the recent conversation history for context: \n\n"
-            prompt += formatted_history
-            prompt += "\n\nUse this conversation history to understand context and references in the current question."
-    print("system_prompt: ", prompt)
-    return prompt
+    print("inside validate_interaction_tool")
+
+    missing = [
+        field
+        for field in REQUIRED_FIELDS
+        if current_form_data.get(field) in (None, "", [])
+    ]
+
+    validation_errors = [
+        f"{field} is required"
+        for field in missing
+    ]
+
+    validation_failed = bool(validation_errors)
+
+    return Command(
+        update={
+            "form_data": {
+                **current_form_data,
+                "validation_errors": validation_errors,
+            },
+            "validation_failed": validation_failed,
+            "messages": [
+                ToolMessage(
+                    content=(
+                        "Validation passed. Form is ready to submit."
+                        if not validation_failed
+                        else (
+                            "Validation failed. "
+                            f"Missing required fields: {', '.join(missing)}."
+                        )
+                    ),
+                    tool_call_id=tool_call_id,
+                    name="validate_interaction_tool",
+                )
+            ],
+        }
+    )
+
+async def validation_response(state: CustomAgentState):
+    validation_errors = (
+        state.get("form_data", {}).get("validation_errors", [])
+    )
+
+    missing_fields = [
+        error.replace(" is required", "")
+        for error in validation_errors
+    ]
+
+    readable_fields = [
+        field.replace("_", " ")
+        for field in missing_fields
+    ]
+
+    if len(readable_fields) == 1:
+        content = (
+            f"The {readable_fields[0]} is required. "
+            f"Please provide the {readable_fields[0]} to continue."
+        )
+    else:
+        content = (
+            "The following fields are required: "
+            f"{', '.join(readable_fields)}. "
+            "Please provide them to continue."
+        )
+
+    return {
+        "messages": [
+            AIMessage(content=content)
+        ]
+    }
 
 def create_simple_custom_agent(
     chat_history: Optional[List[Dict[str, str]]] = None
@@ -565,7 +629,7 @@ def create_simple_custom_agent(
     graph = StateGraph(CustomAgentState)
 
     async def call_model(state: CustomAgentState):
-        print("inside model node")
+        print("*"*20,"inside model node","*"*20)
 
         messages = [
             SystemMessage(content=system_prompt),
@@ -588,8 +652,8 @@ def create_simple_custom_agent(
         return END
 
     async def tool_node(state: CustomAgentState):
-        print("inside tool_node")
-
+        print("*"*20,"inside tool_node","*"*20)
+        print("current_form: ", state.get("form_data"))
         last_message = state["messages"][-1]
         tool_calls = getattr(last_message, "tool_calls", []) or []
 
@@ -637,6 +701,7 @@ def create_simple_custom_agent(
             tool_messages.extend(update.get("messages", []))
 
             current_tool_update = update.get("form_data", {}) or {}
+            print("current_tool_update: ", json.dumps(current_tool_update, indent=2, default=str))
 
             form_updates.update(current_tool_update)
 
@@ -645,6 +710,7 @@ def create_simple_custom_agent(
                 **current_form,
                 **current_tool_update,
             }
+            print("current_form with tool updates: ", json.dumps(current_form, indent=2, default=str))
 
         merged_form = {
             **state.get("form_data", {}),
@@ -661,53 +727,17 @@ def create_simple_custom_agent(
             "messages": tool_messages,
             "form_data": merged_form,
         }
+    
+    async def after_tool_router(state: CustomAgentState):
+        if state.get("validation_failed", False):
+            return "validation_response"
 
-#     async def final_response(state: CustomAgentState):
-#         """
-#         Generate the human-facing response without exposing any tools.
-#         This node cannot initiate another tool call.
-#         """
-#         print("inside final_response node")
-
-#         final_prompt = """
-# You are generating the final response after a form-management tool has
-# already completed successfully.
-
-# Use the tool result and current form data to briefly explain what changed.
-
-# Do not call or request another tool.
-# Do not output JSON.
-# Do not claim that a change occurred unless it appears in the current form data.
-
-# End with exactly:
-# Please provide any further changes, or type done to submit.
-# """
-
-#         messages = [
-#             SystemMessage(content=final_prompt),
-#             *state["messages"],
-#             SystemMessage(
-#                 content=(
-#                     "Current authoritative form data:\n"
-#                     + json.dumps(
-#                         state.get("form_data", {}),
-#                         indent=2,
-#                         default=str,
-#                     )
-#                 )
-#             ),
-#         ]
-
-#         # Important: plain `llm`, not `llm_with_tools`.
-#         result = await llm.ainvoke(messages)
-
-#         return {
-#             "messages": [result],
-#         }
+        return "model"
 
     graph.add_node("model", call_model)
     graph.add_node("tool_node", tool_node)
-    # graph.add_node("final_response", final_response)
+    graph.add_node("validation_response", validation_response)
+    
 
     graph.set_entry_point("model")
 
@@ -720,7 +750,18 @@ def create_simple_custom_agent(
         },
     )
 
-    graph.add_edge("tool_node", "model")
+    # graph.add_edge("tool_node", "model")
+
+    graph.add_conditional_edges(
+        "tool_node",
+        after_tool_router,
+        {
+            "validation_response": "validation_response",
+            "model": "model",
+        },
+    )
+
+    graph.add_edge("validation_response", END)
 
 
-    return graph.compile().with_config({"recursion_limit": 5})
+    return graph.compile().with_config({"recursion_limit": 15})

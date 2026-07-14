@@ -1,7 +1,7 @@
 from typing import List, Dict, Optional, Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from agent.index import create_simple_custom_agent
+from agent.index import create_simple_custom_agent, InteractionFormData, INITIAL_FORM_DATA
 from services.db import (
     create_interaction,
     get_interaction,
@@ -13,6 +13,7 @@ from services.db import (
     reset_interaction_form_data,
     get_messages
 )
+
 import json
 router = APIRouter(tags=["chatRoutes"])
 
